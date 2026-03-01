@@ -47,4 +47,4 @@ If you have suggestions or want to collaborate on any project within the NISO Ec
 
 ---
 
-*© 2026 NiksOriginals. All rights reserved.*
+*© 2026 Niksoriginals. All rights reserved.*
