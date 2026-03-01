@@ -8,29 +8,22 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime, timezone
 
-# ------------------- FIREBASE INITIALIZATION -------------------
 if "FIREBASE_SERVICE_ACCOUNT" not in os.environ:
     raise ValueError("❌ FIREBASE_SERVICE_ACCOUNT environment variable not found!")
 
 service_account_json = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
 
-# Fix for escaped newlines in private_key
 if "private_key" in service_account_json:
     service_account_json["private_key"] = service_account_json["private_key"].replace("\\n", "\n")
 
-# Initialize Firebase
 cred = credentials.Certificate(service_account_json)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
-
-# Firebase Cloud Messaging setup
 SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
 credentials_fc = service_account.Credentials.from_service_account_info(
     service_account_json, scopes=SCOPES
 )
 project_id = service_account_json["project_id"]
-
-# ------------------- TIMESTAMP TRACKING -------------------
 LAST_FILE = "last_timestamp.txt"
 
 def get_last_timestamp():
@@ -40,19 +33,14 @@ def get_last_timestamp():
             ts = f.read().strip()
             if ts:
                 return datetime.fromisoformat(ts)
-    # First time: ignore old data
     return datetime.now(timezone.utc)
 
 def set_last_timestamp(ts: datetime):
     """Save last processed timestamp."""
     with open(LAST_FILE, "w") as f:
         f.write(ts.isoformat())
-
-# ------------------- FIRESTORE & FCM NOTIFIER -------------------
 def check_firestore_and_send_notifications():
     global credentials_fc
-
-    # Refresh FCM token if expired
     if not credentials_fc.valid or credentials_fc.expired:
         credentials_fc.refresh(Request())
     access_token = credentials_fc.token
@@ -62,7 +50,6 @@ def check_firestore_and_send_notifications():
     max_timestamp = last_timestamp
 
     for collection in priority_order:
-        # Fetch only new documents
         docs = (
             db.collection(collection)
             .where("timestamp", ">", last_timestamp)
@@ -75,16 +62,12 @@ def check_firestore_and_send_notifications():
             doc_ts = data.get("timestamp")
             if not doc_ts:
                 continue
-
-            # Convert Firestore timestamp to datetime
             if hasattr(doc_ts, "to_datetime"):
                 doc_dt = doc_ts.to_datetime().replace(tzinfo=timezone.utc)
             else:
                 doc_dt = doc_ts
 
             title = data.get("title", "Something New - Tap to Read")
-
-            # Prepare FCM message
             message = {
                 "message": {
                     "topic": "allUsers",
@@ -108,8 +91,6 @@ def check_firestore_and_send_notifications():
                     },
                 }
             }
-
-            # Send notification
             url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
             headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -122,19 +103,13 @@ def check_firestore_and_send_notifications():
             else:
                 print(f"❌ Failed: {collection} → {title} | {response.status_code}")
                 print(response.text)
-
-            # Track latest timestamp
             if doc_dt > max_timestamp:
                 max_timestamp = doc_dt
 
-    # Save progress
     set_last_timestamp(max_timestamp)
-
-# ------------------- MAIN LOOP -------------------
-CHECK_INTERVAL = 60  # seconds
+CHECK_INTERVAL = 60
 
 print("🚀 Firestore Notification Watcher Started...")
-
 while True:
     try:
         check_firestore_and_send_notifications()
