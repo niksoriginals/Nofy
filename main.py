@@ -6,23 +6,23 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-# 1. Environment Variable Check
+# 1. Firebase Initialization
 if "FIREBASE_SERVICE_ACCOUNT" not in os.environ:
     raise ValueError("❌ FIREBASE_SERVICE_ACCOUNT environment variable not found!")
 
-# 2. Firebase Initialization
 service_account_json = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
-
 if "private_key" in service_account_json:
     service_account_json["private_key"] = service_account_json["private_key"].replace("\\n", "\n")
 
-cred = credentials.Certificate(service_account_json)
-firebase_admin.initialize_app(cred)
+if not firebase_admin._apps:
+    cred = credentials.Certificate(service_account_json)
+    firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 
-# 3. FCM Setup
+# 2. FCM Setup
 SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
 credentials_fc = service_account.Credentials.from_service_account_info(
     service_account_json, scopes=SCOPES
@@ -31,43 +31,35 @@ project_id = service_account_json["project_id"]
 LAST_FILE = "last_timestamp.txt"
 
 def get_last_timestamp():
-    """
-    Sirf wahi timestamp return karega jo ya toh file mein hai 
-    ya current time hai (jo bhi latest ho).
-    """
-    current_utc = datetime.now(timezone.utc)
-    
+    """File se last timestamp uthao, agar nahi hai toh abhi se 1 minute pehle ka time do."""
     if os.path.exists(LAST_FILE):
         with open(LAST_FILE, "r") as f:
             ts_str = f.read().strip()
             if ts_str:
-                file_ts = datetime.fromisoformat(ts_str)
-                # Agar file ka time purana hai, toh current time use karo
-                # Isse purane notifications skip ho jayenge
-                return max(file_ts, current_utc)
+                return datetime.fromisoformat(ts_str)
     
-    return current_utc
+    # Agar pehli baar chal raha hai toh abhi se 1 minute pehle ka time
+    return datetime.now(timezone.utc) - timedelta(minutes=1)
 
 def set_last_timestamp(ts: datetime):
-    """Last processed timestamp ko file mein save karein."""
     with open(LAST_FILE, "w") as f:
         f.write(ts.isoformat())
 
 def check_firestore_and_send_notifications():
     global credentials_fc
-    
-    # Token Refresh logic
     if not credentials_fc.valid or credentials_fc.expired:
         credentials_fc.refresh(Request())
     access_token = credentials_fc.token
 
     priority_order = ["news", "events", "files"]
     last_timestamp = get_last_timestamp()
-    max_timestamp = last_timestamp
-    current_now = datetime.now(timezone.utc)
+    
+    # DEBUG: Check kar rahe hain ki script kis time ke baad ka data dhoond raha hai
+    print(f"🔍 Checking for updates after: {last_timestamp}")
+    
+    new_max_timestamp = last_timestamp
 
     for collection in priority_order:
-        # Firestore query: Sirf last_timestamp ke BAAD wale docs uthao
         docs = (
             db.collection(collection)
             .where("timestamp", ">", last_timestamp)
@@ -79,41 +71,30 @@ def check_firestore_and_send_notifications():
             data = doc.to_dict()
             doc_ts = data.get("timestamp")
             
-            if not doc_ts:
-                continue
-                
-            # Timestamp conversion
+            if not doc_ts: continue
+
+            # Convert Firestore Timestamp to Python Datetime
             if hasattr(doc_ts, "to_datetime"):
                 doc_dt = doc_ts.to_datetime().replace(tzinfo=timezone.utc)
             else:
                 doc_dt = doc_ts
 
-            # FILTER: Agar document galti se current time se pehle ka hai, toh skip karein
-            if doc_dt < current_now:
-                print(f"⏩ Skipping old entry: {doc.id} in {collection}")
-                continue
+            print(f"🔔 New Entry Found: {collection} -> {data.get('title')}")
 
-            title = data.get("title", "Something New - Tap to Read")
-            
-            # FCM Message Payload
+            # FCM Payload
+            title = data.get("title", "New Update")
             message = {
                 "message": {
                     "topic": "allUsers",
-                    "notification": {
-                        "title": "📢 Campus Update",
-                        "body": title,
-                    },
+                    "notification": {"title": "📢 Campus Update", "body": title},
                     "android": {
                         "priority": "HIGH",
                         "notification": {
                             "channel_id": "high_importance_channel",
-                            "default_sound": True,
-                            "default_vibrate_timings": True,
                             "sound": "default",
                         },
                     },
                     "data": {
-                        "click_action": "FLUTTER_NOTIFICATION_CLICK",
                         "collection": collection,
                         "doc_id": doc.id,
                     },
@@ -121,35 +102,24 @@ def check_firestore_and_send_notifications():
             }
 
             url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json; UTF-8",
-            }
+            headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
-            # Sending Notification
-            response = requests.post(url, headers=headers, data=json.dumps(message))
-            
-            if response.status_code == 200:
-                print(f"✅ Sent: {collection} → {title}")
+            resp = requests.post(url, headers=headers, data=json.dumps(message))
+            if resp.status_code == 200:
+                print(f"✅ Notification Sent!")
             else:
-                print(f"❌ Failed: {collection} → {title} | Status: {response.status_code}")
-            
-            # Update max_timestamp for tracking
-            if doc_dt > max_timestamp:
-                max_timestamp = doc_dt
+                print(f"❌ FCM Error: {resp.text}")
 
-    set_last_timestamp(max_timestamp)
+            if doc_dt > new_max_timestamp:
+                new_max_timestamp = doc_dt
 
-# --- Execution ---
-CHECK_INTERVAL = 60 # Har 1 minute mein check karega
+    set_last_timestamp(new_max_timestamp)
 
-print(f"🚀 Watcher Started at {datetime.now(timezone.utc)}")
-print(f"📅 Monitoring for documents created AFTER this moment.")
-
+# --- Loop ---
+print("🚀 Watcher is running...")
 while True:
     try:
         check_firestore_and_send_notifications()
     except Exception as e:
-        print(f"⚠️ Error occurred: {e}")
-    
-    time.sleep(CHECK_INTERVAL)
+        print(f"⚠️ Error: {e}")
+    time.sleep(60)
